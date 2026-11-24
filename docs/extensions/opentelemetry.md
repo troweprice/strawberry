@@ -71,7 +71,7 @@ schema = strawberry.Schema(
 ## API reference:
 
 ```python
-class OpenTelemetryExtension(arg_filter=None): ...
+class OpenTelemetryExtension(arg_filter=None, record_exception_filter=None): ...
 ```
 
 #### `arg_filter: Optional[ArgFilter]`
@@ -81,6 +81,18 @@ data.
 
 ```python
 ArgFilter = Callable[[Dict[str, Any], GraphQLResolveInfo], Dict[str, Any]]
+```
+
+#### `record_exception_filter: Optional[RecordExceptionFilter]`
+
+A function that decides whether an exception raised by a resolver is recorded on
+its span. It receives the exception and returns `True` to record it (an
+`exception` event is added and the span status is set to `ERROR`) or `False` to
+leave the span untouched. The exception is still raised and reported in the
+GraphQL response. By default every exception is recorded.
+
+```python
+RecordExceptionFilter = Callable[[Exception], bool]
 ```
 
 ## More examples:
@@ -149,6 +161,58 @@ schema = strawberry.Schema(
     extensions=[
         OpenTelemetryExtension(
             tracer_provider=MyTracerProvider(),
+        ),
+    ],
+)
+```
+
+</details>
+
+<details>
+  <summary>Using `record_exception_filter`</summary>
+
+Permission denials are an expected outcome rather than a server fault. This
+keeps them from being reported as errors in your tracing backend.
+
+You may want to match on an exception class that only your permission checks
+raise. Matching a broad class such as `StrawberryGraphQLError` would also hide
+other errors that you may want to see.
+
+```python
+import strawberry
+from strawberry.exceptions import StrawberryGraphQLError
+from strawberry.extensions.tracing import OpenTelemetryExtension
+from strawberry.permission import BasePermission
+
+
+class PermissionDeniedError(StrawberryGraphQLError):
+    pass
+
+
+class IsAdmin(BasePermission):
+    message = "Not allowed"
+    error_class = PermissionDeniedError
+
+    def has_permission(self, source, info, **kwargs):
+        return False
+
+
+@strawberry.type
+class Query:
+    @strawberry.field(permission_classes=[IsAdmin])
+    def secret(self) -> str:
+        return "secret"
+
+
+def record_exception_filter(exception: Exception) -> bool:
+    return not isinstance(exception, PermissionDeniedError)
+
+
+schema = strawberry.Schema(
+    Query,
+    extensions=[
+        lambda: OpenTelemetryExtension(
+            record_exception_filter=record_exception_filter,
         ),
     ],
 )

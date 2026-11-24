@@ -28,10 +28,12 @@ if TYPE_CHECKING:
 DATETIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 
 ArgFilter = Callable[[dict[str, Any], "GraphQLResolveInfo"], dict[str, Any]]
+RecordExceptionFilter = Callable[[Exception], bool]
 
 
 class OpenTelemetryExtension(SchemaExtension):
     _arg_filter: ArgFilter | None
+    _record_exception_filter: RecordExceptionFilter | None
     _span_holder: dict[LifecycleStep, Span]
     _tracer: Tracer
 
@@ -40,9 +42,11 @@ class OpenTelemetryExtension(SchemaExtension):
         *,
         execution_context: ExecutionContext | None = None,
         arg_filter: ArgFilter | None = None,
+        record_exception_filter: RecordExceptionFilter | None = None,
         tracer_provider: trace.TracerProvider | None = None,
     ) -> None:
         self._arg_filter = arg_filter
+        self._record_exception_filter = record_exception_filter
         self._tracer = trace.get_tracer("strawberry", tracer_provider=tracer_provider)
         self._span_holder = {}
         if execution_context:
@@ -149,6 +153,11 @@ class OpenTelemetryExtension(SchemaExtension):
                 converted_value = self.convert_to_allowed_types(value)
                 span.set_attribute(f"graphql.param.{kwarg}", converted_value)
 
+    def should_record_exception(self, exception: Exception) -> bool:
+        if self._record_exception_filter is None:
+            return True
+        return self._record_exception_filter(exception)
+
     async def resolve(
         self,
         _next: Callable,
@@ -172,12 +181,21 @@ class OpenTelemetryExtension(SchemaExtension):
             ),
         ) as span:
             self.add_tags(span, info, kwargs)
-            result = _next(root, info, *args, **kwargs)
+            try:
+                result = _next(root, info, *args, **kwargs)
 
-            if isawaitable(result):
-                result = await result
+                if isawaitable(result):
+                    result = await result
+            except Exception as exc:
+                if self.should_record_exception(exc):
+                    raise
+                # Hold the exception until the span has closed, so that
+                # OpenTelemetry neither records it nor marks the span as failed.
+                unrecorded_exception = exc
+            else:
+                return result
 
-            return result
+        raise unrecorded_exception
 
 
 class OpenTelemetryExtensionSync(OpenTelemetryExtension):
@@ -199,7 +217,16 @@ class OpenTelemetryExtensionSync(OpenTelemetryExtension):
             ),
         ) as span:
             self.add_tags(span, info, kwargs)
-            return _next(root, info, *args, **kwargs)
+            try:
+                return _next(root, info, *args, **kwargs)
+            except Exception as exc:
+                if self.should_record_exception(exc):
+                    raise
+                # Hold the exception until the span has closed, so that
+                # OpenTelemetry neither records it nor marks the span as failed.
+                unrecorded_exception = exc
+
+        raise unrecorded_exception
 
 
 __all__ = ["OpenTelemetryExtension", "OpenTelemetryExtensionSync"]
